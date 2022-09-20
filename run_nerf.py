@@ -27,6 +27,8 @@ DEBUG = False
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
     """
+
+    # chunk若不为零则按照minibatch的方法计算所有输入的结果
     if chunk is None:
         return fn
     def ret(inputs):
@@ -37,15 +39,23 @@ def batchify(fn, chunk):
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
+
+    # 对坐标进行位置编码
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
 
     if viewdirs is not None:
+        # 对视角进行位置编码
         input_dirs = viewdirs[:,None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
+
+        # 创建输入向量
         embedded = torch.cat([embedded, embedded_dirs], -1)
 
+    # 计算输出
+    # 是否使用minibatch
+    # netchunk即为采样点的batch-size
     outputs_flat = batchify(fn, netchunk)(embedded)
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
@@ -92,6 +102,8 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
       acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
       extras: dict with everything returned by render_rays().
     """
+
+    # 从变换矩阵中解析光线始发点和光线方向
     if c2w is not None:
         # special case to render full image
         rays_o, rays_d = get_rays(H, W, K, c2w)
@@ -105,24 +117,34 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         if c2w_staticcam is not None:
             # special case to visualize effect of viewdirs
             rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
+
+        # 视角向量归一化
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
+        # 非常清楚
+        # 视角向量使用一个3维向量表示
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
     sh = rays_d.shape # [..., 3]
+
+    # 是否转换到标准设备坐标系
     if ndc:
         # for forward facing scenes
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
 
     # Create ray batch
+    # 创建光线
     rays_o = torch.reshape(rays_o, [-1,3]).float()
     rays_d = torch.reshape(rays_d, [-1,3]).float()
 
+    # 整合数据
+    # 对于每一条光线有四个参数：光线起始点、光线方向、近端裁剪深度、远端裁剪深度
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
     rays = torch.cat([rays_o, rays_d, near, far], -1)
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
+    # 采样、模型正向计算过程
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
@@ -149,6 +171,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
+        #  c2w：相机坐标到世界坐标的变换矩阵
         print(i, time.time() - t)
         t = time.time()
         rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
@@ -184,6 +207,7 @@ def create_nerf(args):
 
     input_ch_views = 0
     embeddirs_fn = None
+    # 是否使用视角作为输入
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
@@ -195,11 +219,22 @@ def create_nerf(args):
 
     model_fine = None
     if args.N_importance > 0:
+        # 若优化了采样
+        # 需要引入第二个模型
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+
+        # 同时优化
         grad_vars += list(model_fine.parameters())
 
+    # 创建训练流程函数
+    # inputs：坐标输入
+    # viewdirs：视角输入
+    # network_fn：网络
+    # embed_fn：坐标embedding
+    # embeddirs_fn：视角embedding
+    # netchunk：mini-batch，注意，是采样点的mini-batch，即真的送入网络的mini-batch，不是ray的数量
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
@@ -215,12 +250,14 @@ def create_nerf(args):
     ##########################
 
     # Load checkpoints
+    # 加载权重
     if args.ft_path is not None and args.ft_path!='None':
         ckpts = [args.ft_path]
     else:
         ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if 'tar' in f]
 
     print('Found ckpts', ckpts)
+    # 加载优化器状态以及模型参数
     if len(ckpts) > 0 and not args.no_reload:
         ckpt_path = ckpts[-1]
         print('Reloading from', ckpt_path)
@@ -236,6 +273,17 @@ def create_nerf(args):
 
     ##########################
 
+    # 创建训练参数
+
+    # network_query_fn：推理函数
+    # perturb：是否对光线进行随机采样，1为随机
+    # N_importance：fine阶段的采样数
+    # network_fine：fine阶段模型
+    # N_samples：coarse阶段采样数
+    # network_fn：coarse阶段模型
+    # use_viewdirs：是否使用视角向量
+    # white_bkgd：是否使用白色背景
+    # raw_noise_std：施加到体素密度的随机噪声
     render_kwargs_train = {
         'network_query_fn' : network_query_fn,
         'perturb' : args.perturb,
@@ -249,11 +297,15 @@ def create_nerf(args):
     }
 
     # NDC only good for LLFF-style forward facing data
+    # 重要：NDC仅用于llff
     if args.dataset_type != 'llff' or args.no_ndc:
         print('Not ndc!')
         render_kwargs_train['ndc'] = False
         render_kwargs_train['lindisp'] = args.lindisp
 
+    # 复制一份参数设定，并修改部分参数
+    # 1. 将perturb改为False，即固定采样
+    # 2. 去除额外添加的噪声
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
@@ -647,11 +699,12 @@ def train():
 
     # Create nerf model
     # 创建模型
-    # 主要是生成如下几个东西
-    # 1. render_kwargs_trains：训练渲染设置
-    # 2. render_kwargs_test：测试渲染设置
-    # 3. start：起始迭代步
-    # 4. grad_vars：
+
+    # 返回值为
+    # 1. render_kwargs_train：训练参数
+    # 2. render_kwargs_test：测试参数
+    # 3. start：起始step
+    # 4. grad_vars：待优化参数
     # 5. optimizer：优化器
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
@@ -668,10 +721,13 @@ def train():
     render_poses = torch.Tensor(render_poses).to(device)
 
     # Short circuit if only rendering out from trained model
+
+    # 是否仅渲染输出
     if args.render_only:
         print('RENDER ONLY')
         with torch.no_grad():
             if args.render_test:
+                # 若渲染test数据集，则加载test图像数据
                 # render_test switches to test poses
                 images = images[i_test]
             else:
@@ -682,7 +738,22 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            # render_poses：变换矩阵
+            # hwf：长宽以及焦距
+            # K：未知
+            # chunk：光线mini-batch
+            # render_kwargs_test：test参数
+            # gt_imgs：ground true
+            # savedir：保存目录
+            # render_factor：降采样倍率，用于加速训练
+            rgbs, _ = render_path(render_poses,
+                                  hwf,
+                                  K,
+                                  args.chunk,
+                                  render_kwargs_test,
+                                  gt_imgs=images,
+                                  savedir=testsavedir,
+                                  render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 

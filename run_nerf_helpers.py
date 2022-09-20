@@ -90,7 +90,14 @@ def get_embedder(multires, i=0):
 # Model
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
-        """ 
+        """
+        D: 网络总深度
+        W：网络宽度
+        input_ch：坐标输入维度
+        input_ch_views：视角输入维度
+        output_ch：输出维度
+        skips：residual 模块位置
+        use_viewdirs：是否使用视角向量
         """
         super(NeRF, self).__init__()
         self.D = D
@@ -104,6 +111,8 @@ class NeRF(nn.Module):
             [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
         ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
+        # 实际上paper中也是这样的
+        # 参考论文附录
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
 
         ### Implementation according to the paper
@@ -127,6 +136,8 @@ class NeRF(nn.Module):
                 h = torch.cat([input_pts, h], -1)
 
         if self.use_viewdirs:
+            # 执行推理
+            # 和文献中的一致
             alpha = self.alpha_linear(h)
             feature = self.feature_linear(h)
             h = torch.cat([feature, input_views], -1)
@@ -138,6 +149,7 @@ class NeRF(nn.Module):
             rgb = self.rgb_linear(h)
             outputs = torch.cat([rgb, alpha], -1)
         else:
+            # 不使用view
             outputs = self.output_linear(h)
 
         return outputs    
@@ -175,13 +187,21 @@ class NeRF(nn.Module):
 
 # Ray helpers
 def get_rays(H, W, K, c2w):
+
+    # 创建像素坐标网格
     i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))  # pytorch's meshgrid has indexing='ij'
     i = i.t()
     j = j.t()
+
+    # 计算光线方向
     dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)], -1)
+
+    # 对方向向量进行旋转变换
     # Rotate ray directions from camera frame to the world frame
     rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
+
+    # 对原点坐标进行平移变换
     rays_o = c2w[:3,-1].expand(rays_d.shape)
     return rays_o, rays_d
 

@@ -27,6 +27,11 @@ rot_theta = lambda th : torch.Tensor([
 
 
 def pose_spherical(theta, phi, radius):
+    # 根据输入的theta、phi以及radius确定旋转矩阵
+    # theta为绕着y轴旋转
+    # phi为绕着x轴旋转
+    # 右手系
+    # 旋转完毕后，转为左手系
     c2w = trans_t(radius)
     c2w = rot_phi(phi/180.*np.pi) @ c2w
     c2w = rot_theta(theta/180.*np.pi) @ c2w
