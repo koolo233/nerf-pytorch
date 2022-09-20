@@ -85,7 +85,13 @@ def load_blender_data(basedir, half_res=False, testskip=1):
         imgs = imgs_half_res
         # imgs = tf.image.resize_area(imgs, [400, 400]).numpy()
 
-        
+
+    # 返回值为
+    # 1. imgs：所有图片
+    # 2. poses：所有的4x4变换矩阵
+    # 3. render_poses：所有的渲染输出视角
+    # 4. [H, W, focal]：成像长宽以及焦距
+    # 5. i_split：区分train、val和test的索引值
     return imgs, poses, render_poses, [H, W, focal], i_split
 
 

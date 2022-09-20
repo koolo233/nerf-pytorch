@@ -19,20 +19,30 @@ class Embedder:
         
     def create_embedding_fn(self):
         embed_fns = []
+        # 输入维度
         d = self.kwargs['input_dims']
         out_dim = 0
+        # 是否在输出中包含原始坐标
         if self.kwargs['include_input']:
             embed_fns.append(lambda x : x)
             out_dim += d
-            
+
+        # 最大频率，以log2为底，实际上就是位置编码的L
         max_freq = self.kwargs['max_freq_log2']
+        # 生成多少项，传统就是L
         N_freqs = self.kwargs['num_freqs']
         
         if self.kwargs['log_sampling']:
             freq_bands = 2.**torch.linspace(0., max_freq, steps=N_freqs)
         else:
             freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
-            
+
+        # -------
+        # 注意
+        # -------
+        # 这个地方的实现和论文中的描述不同，
+        # 实际上不是sin(2^L \pi p)  cos(2^L \pi p)
+        # 而是sin(2^L p)  cos(2^L p)
         for freq in freq_bands:
             for p_fn in self.kwargs['periodic_fns']:
                 embed_fns.append(lambda x, p_fn=p_fn, freq=freq : p_fn(x * freq))
@@ -46,9 +56,23 @@ class Embedder:
 
 
 def get_embedder(multires, i=0):
+
+    # 若为-1则不进行位置编码，直接返回原坐标x,y,z
     if i == -1:
         return nn.Identity(), 3
-    
+
+    # 位置编码的参数
+    # inclue_input：是否将位置作为输入
+    # input_dims： 输入维度
+    # max_freq_log2： embedding_func的最大频率，实际上就是2^L项
+    # num_freqs：一共多少项，实际上就是原文中位置编码的L
+    # log_sampling：是否使用对数
+    # periodic_fns：使用的周期函数
+
+    # log_sampling没有用，
+    # 无论log_sampling是True还是False
+    # 频率均是2^L
+
     embed_kwargs = {
                 'include_input' : True,
                 'input_dims' : 3,
@@ -237,3 +261,8 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
     return samples
+
+
+if __name__ == "__main__":
+    emb_func, _ = get_embedder(2)
+    print(emb_func(torch.ones(3) * torch.pi))

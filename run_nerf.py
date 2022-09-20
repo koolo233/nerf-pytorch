@@ -178,6 +178,8 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    # 获取位置编码向量
+    # i_embed：是否使用embedding，默认为使用，-1则不使用
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
     input_ch_views = 0
@@ -567,13 +569,19 @@ def train():
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
+
+        # 获取所有的blender格式数据
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
+        # 定义近端裁剪平面深度以及远端裁剪平面深度
         near = 2.
         far = 6.
 
+        # 判断是否使用白色背景
+        # 若使用，则将透明通道转换为白色背景
+        # 否则直接取前三个通道的数据
         if args.white_bkgd:
             images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
         else:
@@ -619,6 +627,7 @@ def train():
             [0, 0, 1]
         ])
 
+    # 判断是否渲染test中的图片
     if args.render_test:
         render_poses = np.array(poses[i_test])
 
@@ -637,9 +646,17 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
+    # 创建模型
+    # 主要是生成如下几个东西
+    # 1. render_kwargs_trains：训练渲染设置
+    # 2. render_kwargs_test：测试渲染设置
+    # 3. start：起始迭代步
+    # 4. grad_vars：
+    # 5. optimizer：优化器
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
 
+    # 获取近端裁剪深度以及远端裁剪深度
     bds_dict = {
         'near' : near,
         'far' : far,
