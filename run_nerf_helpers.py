@@ -237,6 +237,7 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 
 # Hierarchical sampling (section 5.2)
+# 分层采样主函数
 def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     # Get pdf
     weights = weights + 1e-5 # prevent nans

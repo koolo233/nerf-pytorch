@@ -57,6 +57,8 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     # 是否使用minibatch
     # netchunk即为采样点的batch-size
     outputs_flat = batchify(fn, netchunk)(embedded)
+    # 重新变换为与input相同的shape
+    # input：[n_rays, n_samples, 3]
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
@@ -147,9 +149,13 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     # 采样、模型正向计算过程
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
+        # 整的这么复杂
+        # sh[:-1]就是n_rays
+        # 目的是确保维度没问题
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
+    # 创建输出
     k_extract = ['rgb_map', 'disp_map', 'acc_map']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
@@ -174,7 +180,9 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         #  c2w：相机坐标到世界坐标的变换矩阵
         print(i, time.time() - t)
         t = time.time()
+        # 执行推理
         rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        # 将rgbs和disps转移到cpu上
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
         if i==0:
@@ -186,6 +194,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
             print(p)
         """
 
+        # 保存
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
@@ -326,16 +335,27 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
+    # raw：体素密度
+    # dists：相邻两个采样点之间的距离
+    # 为了确保计算正确，对体素密度的预测进行约束，[0,\infty]
+    # 最终得到的就是公式中的alpha
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
+    # 计算样本之间的距离
     dists = z_vals[...,1:] - z_vals[...,:-1]
+    # 最后补充一个无限大距离
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
+    # 确保深度正确
+    # 若rays_d没有归一化，那么深度还需要乘以rays_d的模长
+    # 实际上rays_d之前进行了归一化，这里没啥问题
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
+    # 颜色区间限定，约束到[0, 1]
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
     noise = 0.
     if raw_noise_std > 0.:
+        # 是否为体素密度添加随机噪声
         noise = torch.randn(raw[...,3].shape) * raw_noise_std
 
         # Overwrite randomly sampled data if pytest
@@ -346,11 +366,19 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
 
     alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
+
+    # 体素渲染公式中的颜色权重项，即T_i * alpha_i
+    # T_i:使用torch.cumprod计算累积
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+
+    # 计算每一条光线的最终颜色
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
+    # 每一条光线对应位置的估计深度
     depth_map = torch.sum(weights * z_vals, -1)
+    # 深度估计的倒数
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
+    # 每一条光线的权重和
     acc_map = torch.sum(weights, -1)
 
     if white_bkgd:
@@ -372,6 +400,18 @@ def render_rays(ray_batch,
                 raw_noise_std=0.,
                 verbose=False,
                 pytest=False):
+    # ray_batch: 光线的起始点，方向，最小深度，最大深度
+    # network_fn：模型
+    # N_samples：每一条光线的采样数
+    # retraw：是否返回原始数据
+    # lindisp：是否采用深度反比例采样
+    # perturb：采样时是否在小范围内随机波动
+    # N_importance：fine阶段的额外采样数
+    # network_fine：fine阶段使用的模型
+    # white_bkgd：是否使用白色背景
+    # raw_noise_std：是否添加噪声
+    # verbose：debug模式
+    # pytest：是否使用固定随机种子
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -402,26 +442,42 @@ def render_rays(ray_batch,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
+    # 获取rays batchsize
     N_rays = ray_batch.shape[0]
+    # 获取rays origins & directions
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
+    # 获取viewdirections
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
+    # 获取近端裁剪深度以及远端裁剪深度
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
+    # 生成采样深度
     t_vals = torch.linspace(0., 1., steps=N_samples)
     if not lindisp:
+        # 线性采样
         z_vals = near * (1.-t_vals) + far * (t_vals)
     else:
+        # 非线性采样
+        # 按照反比例采样
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
 
     z_vals = z_vals.expand([N_rays, N_samples])
 
     if perturb > 0.:
+
+        # 随机深度采样
+
         # get intervals between samples
+        # 获取采样点之间的间隔
         mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+
+        # 拼接mids和最大一个样本
         upper = torch.cat([mids, z_vals[...,-1:]], -1)
+        # 拼接mids和最小一个样本
         lower = torch.cat([z_vals[...,:1], mids], -1)
         # stratified samples in those intervals
+        # 生成（0，1）的随机数
         t_rand = torch.rand(z_vals.shape)
 
         # Pytest, overwrite u with numpy's fixed random numbers
@@ -430,32 +486,47 @@ def render_rays(ray_batch,
             t_rand = np.random.rand(*list(z_vals.shape))
             t_rand = torch.Tensor(t_rand)
 
+        # 采样点在小范围内随机波动
         z_vals = lower + (upper - lower) * t_rand
 
+    # rays_o：[n_rays, 3]  光线原点
+    # rays_d：[n_rays, 3]  光线方向
+    # z_vals：[n_rays, sample_num] 采样深度
+    # 计算所有样本点的xyz
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
 #     raw = run_network(pts)
+    # 正向推理
+    # raw：包含rgb以及sigma在内的数据
     raw = network_query_fn(pts, viewdirs, network_fn)
+    # 生成结果
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
+        # 是否启用fine网络
 
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        # 分层采样核心
+        # 利用coarse阶段得到的weights指导fine阶段采样
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
         z_samples = z_samples.detach()
 
+        # 合并追加的采样点以及coarse阶段就使用了的采样点
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
 
+        # 执行推理
         run_fn = network_fn if network_fine is None else network_fine
 #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
+        # 计算输出
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
+    # 创建输出
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
     if retraw:
         ret['raw'] = raw
@@ -465,6 +536,7 @@ def render_rays(ray_batch,
         ret['acc0'] = acc_map_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
+    # 数值检查
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
             print(f"! [Numerical Error] {k} contains nan or inf.")
@@ -755,6 +827,7 @@ def train():
                                   savedir=testsavedir,
                                   render_factor=args.render_factor)
             print('Done rendering', testsavedir)
+            # 保存动图
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
             return
@@ -763,6 +836,7 @@ def train():
     N_rand = args.N_rand
     use_batching = not args.no_batching
     if use_batching:
+        # 准备随机选择rays
         # For random ray batching
         print('get rays')
         rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
@@ -800,6 +874,7 @@ def train():
         time0 = time.time()
 
         # Sample random ray batch
+        # 从所有可选rays中随机采样
         if use_batching:
             # Random over all images
             batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
@@ -813,6 +888,7 @@ def train():
                 rays_rgb = rays_rgb[rand_idx]
                 i_batch = 0
 
+        # 仅从一张图片中随机采rays
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
@@ -836,6 +912,7 @@ def train():
                 else:
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
+                # 创建训练用rays
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
@@ -845,6 +922,7 @@ def train():
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
+        # 训练主循环
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
@@ -853,9 +931,13 @@ def train():
         img_loss = img2mse(rgb, target_s)
         trans = extras['raw'][...,-1]
         loss = img_loss
+        # 转换为评价指标
         psnr = mse2psnr(img_loss)
 
         if 'rgb0' in extras:
+            # 是否启用了fine
+            # 若启用了，则需要额外计算coarse阶段的损失
+            # 并叠加两个阶段的损失
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
@@ -865,6 +947,7 @@ def train():
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
+        # 学习率更新
         decay_rate = 0.1
         decay_steps = args.lrate_decay * 1000
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
@@ -878,6 +961,7 @@ def train():
 
         # Rest is logging
         if i%args.i_weights==0:
+            # 保存权重
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
             torch.save({
                 'global_step': global_step,
@@ -888,6 +972,7 @@ def train():
             print('Saved checkpoints at', path)
 
         if i%args.i_video==0 and i > 0:
+            # 保存测试输出
             # Turn on testing mode
             with torch.no_grad():
                 rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
@@ -904,6 +989,7 @@ def train():
             #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
         if i%args.i_testset==0 and i > 0:
+            # 对测试数据集进行测试
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
